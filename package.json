@@ -1,0 +1,34 @@
+{
+  "name": "cdp-mcp-server",
+  "version": "2.0.0",
+  "description": "System-wide MCP server exposing full Chrome DevTools Protocol: breakpoints, stack traces, stepping, scope inspection, network interception, and source maps.",
+  "type": "module",
+  "main": "dist/index.js",
+  "bin": {
+    "cdp-mcp-server": "dist/bin/cdp-mcp-server.js"
+  },
+  "scripts": {
+    "build": "tsc",
+    "dev": "tsc --watch",
+    "start": "node dist/bin/cdp-mcp-server.js",
+    "start:http": "node dist/bin/cdp-mcp-server.js --http --port 3100",
+    "link": "npm run build && npm link"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.29.0",
+    "chrome-remote-interface": "^0.34.0",
+    "express": "^5.1.0",
+    "source-map": "^0.7.4"
+  },
+  "devDependencies": {
+    "@types/express": "^5.0.0",
+    "@types/node": "^22.0.0",
+    "devtools-protocol": "^0.0.1612613",
+    "typescript": "^5.8.0"
+  },
+  "engines": {
+    "node": ">=20.0.0"
+  },
+  "license": "MIT",
+  "author": "shiftroot"
+}
