@@ -26,6 +26,7 @@ declare module 'chrome-remote-interface' {
 
   interface CDPClient {
     close(): Promise<void>;
+    send(method: string, params?: any): Promise<any>;
 
     // Domains — we define the ones we use
     Debugger: {

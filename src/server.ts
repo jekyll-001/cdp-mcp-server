@@ -521,5 +521,27 @@ export function createServer(args: CLIArgs) {
     }
   );
 
+  server.tool(
+    'cdp_send_command',
+    'Send a raw CDP command to the browser. Unlocks all CDP domains (Page, DOM, Input, Fetch, etc.) except Accessibility and Memory.',
+    {
+      method: z.string().describe('The full CDP method name, e.g. "Page.navigate", "DOM.getDocument", "Input.dispatchMouseEvent"'),
+      params: z.record(z.string(), z.any()).optional().describe('JSON object containing parameters for the CDP command'),
+    },
+    async (params) => {
+      // Enforce restrictions: Block Memory and Accessibility domains
+      if (params.method.startsWith('Memory.') || params.method.startsWith('Accessibility.')) {
+        return { content: [{ type: 'text', text: `Error: The ${params.method.split('.')[0]} domain is explicitly disabled.` }], isError: true };
+      }
+
+      try {
+        const result = await cdpClient.cdp.send(params.method as any, params.params);
+        return { content: [{ type: 'text', text: JSON.stringify(result, null, 2) }] };
+      } catch (error: any) {
+        return { content: [{ type: 'text', text: `CDP Error: ${error.message}` }], isError: true };
+      }
+    }
+  );
+
   return { server, cdpClient, networkMgr };
 }
