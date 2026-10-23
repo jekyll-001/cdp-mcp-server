@@ -5,32 +5,40 @@
 
 import type { CapturedRequest, PausedRequest } from '../types.js';
 import type { CDPClient } from '../cdp-client.js';
+import { SessionManager } from './session-manager.js';
 
 const AUTO_CONTINUE_TIMEOUT_MS = 30_000;
 
-export class NetworkManager {
-  private cdpClient: CDPClient;
+export class NetworkManager extends SessionManager {
   private networkEnabled = false;
   private fetchEnabled = false;
+  private fetchListening = false;
   private requests = new Map<string, CapturedRequest>();
   private pausedRequests = new Map<string, PausedRequest>();
   private autoContTimers = new Map<string, NodeJS.Timeout>();
   private maxRequestBuffer = 500;
 
   constructor(cdpClient: CDPClient) {
-    this.cdpClient = cdpClient;
+    super(cdpClient);
   }
 
-  private get cdp() {
-    return this.cdpClient.cdp;
+  override reset(): void {
+    super.reset();
+    this.networkEnabled = false;
+    this.fetchEnabled = false;
+    this.fetchListening = false;
+    this.requests.clear();
+    this.pausedRequests.clear();
+    for (const timer of this.autoContTimers.values()) clearTimeout(timer);
+    this.autoContTimers.clear();
   }
 
   async enableNetworkMonitoring(): Promise<void> {
     if (this.networkEnabled) return;
 
-    await this.cdp.Network.enable({});
+    const { cdp, assertCurrent } = this.capture();
 
-    this.cdp.Network.requestWillBeSent((params: any) => {
+    this.listen('Network.requestWillBeSent', (params: any) => {
       const req: CapturedRequest = {
         requestId: params.requestId,
         url: params.request.url,
@@ -47,7 +55,7 @@ export class NetworkManager {
       }
     });
 
-    this.cdp.Network.responseReceived((params: any) => {
+    this.listen('Network.responseReceived', (params: any) => {
       const req = this.requests.get(params.requestId);
       if (req) {
         req.response = {
@@ -59,6 +67,8 @@ export class NetworkManager {
       }
     });
 
+    await cdp.Network.enable({});
+    assertCurrent();
     this.networkEnabled = true;
   }
 
@@ -87,8 +97,10 @@ export class NetworkManager {
   }
 
   async getResponseBody(requestId: string): Promise<{ body: string; base64Encoded: boolean }> {
+    const { cdp, assertCurrent } = this.capture();
     await this.ensureNetworkEnabled();
-    const result = await this.cdp.Network.getResponseBody({ requestId });
+    assertCurrent();
+    const result = await cdp.Network.getResponseBody({ requestId });
     return { body: result.body, base64Encoded: result.base64Encoded };
   }
 
@@ -101,8 +113,10 @@ export class NetworkManager {
   async enableInterception(args: {
     patterns: Array<{ urlPattern?: string; resourceType?: string; requestStage?: string }>;
   }): Promise<{ enabled: boolean; patterns: number }> {
+    const { cdp, assertCurrent } = this.capture();
     if (this.fetchEnabled) {
       await this.disableInterception();
+      assertCurrent();
     }
 
     const patterns = args.patterns.map(p => ({
@@ -111,50 +125,57 @@ export class NetworkManager {
       requestStage: p.requestStage ?? 'Request',
     }));
 
-    await this.cdp.Fetch.enable({ patterns });
+    if (!this.fetchListening) {
+      this.listen('Fetch.requestPaused', (params: any) => {
+        const paused: PausedRequest = {
+          requestId: params.requestId,
+          request: {
+            url: params.request.url,
+            method: params.request.method,
+            headers: params.request.headers as Record<string, string>,
+            postData: params.request.postData,
+          },
+          resourceType: params.resourceType,
+          responseStatusCode: params.responseStatusCode,
+          timestamp: Date.now(),
+        };
 
-    this.cdp.Fetch.requestPaused((params: any) => {
-      const paused: PausedRequest = {
-        requestId: params.requestId,
-        request: {
-          url: params.request.url,
-          method: params.request.method,
-          headers: params.request.headers as Record<string, string>,
-          postData: params.request.postData,
-        },
-        resourceType: params.resourceType,
-        responseStatusCode: params.responseStatusCode,
-        timestamp: Date.now(),
-      };
+        this.pausedRequests.set(params.requestId, paused);
+        console.error(`[network] Intercepted: ${params.request.method} ${params.request.url}`);
 
-      this.pausedRequests.set(params.requestId, paused);
-      console.error(`[network] Intercepted: ${params.request.method} ${params.request.url}`);
+        const timer = setTimeout(async () => {
+          if (this.pausedRequests.has(params.requestId)) {
+            console.error(`[network] Auto-continuing timed-out request: ${params.request.url}`);
+            try {
+              await cdp.Fetch.continueRequest({ requestId: params.requestId });
+            } catch { /* request may already be handled */ }
+            try { assertCurrent(); } catch { return; }
+            this.pausedRequests.delete(params.requestId);
+            this.autoContTimers.delete(params.requestId);
+          }
+        }, AUTO_CONTINUE_TIMEOUT_MS);
 
-      const timer = setTimeout(async () => {
-        if (this.pausedRequests.has(params.requestId)) {
-          console.error(`[network] Auto-continuing timed-out request: ${params.request.url}`);
-          try {
-            await this.cdp.Fetch.continueRequest({ requestId: params.requestId });
-          } catch { /* request may already be handled */ }
-          this.pausedRequests.delete(params.requestId);
-        }
-      }, AUTO_CONTINUE_TIMEOUT_MS);
+        this.autoContTimers.set(params.requestId, timer);
+      });
 
-      this.autoContTimers.set(params.requestId, timer);
-    });
-
+      this.fetchListening = true;
+    }
+    await cdp.Fetch.enable({ patterns });
+    assertCurrent();
     this.fetchEnabled = true;
     return { enabled: true, patterns: patterns.length };
   }
 
   async disableInterception(): Promise<{ disabled: boolean; pendingContinued: number }> {
+    const { cdp, assertCurrent } = this.capture();
     let continued = 0;
     for (const [reqId] of this.pausedRequests) {
       try {
-        await this.cdp.Fetch.continueRequest({ requestId: reqId });
+        await cdp.Fetch.continueRequest({ requestId: reqId });
         continued++;
       } catch { /* ignore */ }
     }
+    assertCurrent();
     this.pausedRequests.clear();
 
     for (const timer of this.autoContTimers.values()) {
@@ -163,9 +184,10 @@ export class NetworkManager {
     this.autoContTimers.clear();
 
     try {
-      await this.cdp.Fetch.disable();
+      await cdp.Fetch.disable();
     } catch { /* ignore if already disabled */ }
 
+    assertCurrent();
     this.fetchEnabled = false;
     return { disabled: true, pendingContinued: continued };
   }
@@ -181,14 +203,16 @@ export class NetworkManager {
     headers?: Array<{ name: string; value: string }>;
     postData?: string;
   }): Promise<{ continued: boolean }> {
-    this.clearAutoTimer(args.requestId);
-    await this.cdp.Fetch.continueRequest({
+    const { cdp, assertCurrent } = this.capture();
+    await cdp.Fetch.continueRequest({
       requestId: args.requestId,
       url: args.url,
       method: args.method,
       headers: args.headers,
       postData: args.postData,
     });
+    assertCurrent();
+    this.clearAutoTimer(args.requestId);
     this.pausedRequests.delete(args.requestId);
     return { continued: true };
   }
@@ -197,11 +221,13 @@ export class NetworkManager {
     requestId: string;
     reason: string;
   }): Promise<{ failed: boolean }> {
-    this.clearAutoTimer(args.requestId);
-    await this.cdp.Fetch.failRequest({
+    const { cdp, assertCurrent } = this.capture();
+    await cdp.Fetch.failRequest({
       requestId: args.requestId,
       reason: args.reason,
     });
+    assertCurrent();
+    this.clearAutoTimer(args.requestId);
     this.pausedRequests.delete(args.requestId);
     return { failed: true };
   }
@@ -212,13 +238,15 @@ export class NetworkManager {
     responseHeaders?: Array<{ name: string; value: string }>;
     body?: string;
   }): Promise<{ fulfilled: boolean }> {
-    this.clearAutoTimer(args.requestId);
-    await this.cdp.Fetch.fulfillRequest({
+    const { cdp, assertCurrent } = this.capture();
+    await cdp.Fetch.fulfillRequest({
       requestId: args.requestId,
       responseCode: args.responseCode,
       responseHeaders: args.responseHeaders,
       body: args.body ? Buffer.from(args.body).toString('base64') : undefined,
     });
+    assertCurrent();
+    this.clearAutoTimer(args.requestId);
     this.pausedRequests.delete(args.requestId);
     return { fulfilled: true };
   }

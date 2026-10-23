@@ -4,28 +4,31 @@
 
 import type { ConsoleMessage, RemoteObject } from '../types.js';
 import type { CDPClient } from '../cdp-client.js';
+import { SessionManager } from './session-manager.js';
 
-export class RuntimeManager {
-  private cdpClient: CDPClient;
+export class RuntimeManager extends SessionManager {
   private enabled = false;
   private consoleLogs: ConsoleMessage[] = [];
   private nextConsoleId = 1;
   private maxBufferSize = 500;
 
   constructor(cdpClient: CDPClient) {
-    this.cdpClient = cdpClient;
+    super(cdpClient);
   }
 
-  private get cdp() {
-    return this.cdpClient.cdp;
+  override reset(): void {
+    super.reset();
+    this.enabled = false;
+    this.consoleLogs = [];
+    this.nextConsoleId = 1;
   }
 
   async enable(): Promise<void> {
     if (this.enabled) return;
 
-    await this.cdp.Runtime.enable();
+    const { cdp, assertCurrent } = this.capture();
 
-    this.cdp.Runtime.consoleAPICalled((params: any) => {
+    this.listen('Runtime.consoleAPICalled', (params: any) => {
       const text = params.args
         .map((arg: any) => {
           if (arg.type === 'string') return arg.value as string;
@@ -53,7 +56,7 @@ export class RuntimeManager {
       }
     });
 
-    this.cdp.Runtime.exceptionThrown((params: any) => {
+    this.listen('Runtime.exceptionThrown', (params: any) => {
       const ex = params.exceptionDetails;
       const msg: ConsoleMessage = {
         id: this.nextConsoleId++,
@@ -68,8 +71,11 @@ export class RuntimeManager {
       };
 
       this.consoleLogs.push(msg);
+      if (this.consoleLogs.length > this.maxBufferSize) this.consoleLogs = this.consoleLogs.slice(-this.maxBufferSize);
     });
 
+    await cdp.Runtime.enable();
+    assertCurrent();
     this.enabled = true;
   }
 
@@ -78,9 +84,11 @@ export class RuntimeManager {
     returnByValue?: boolean;
     awaitPromise?: boolean;
   }): Promise<{ result: string; type: string; objectId?: string }> {
+    const { cdp, assertCurrent } = this.capture();
     await this.ensureEnabled();
+    assertCurrent();
 
-    const evalResult = await this.cdp.Runtime.evaluate({
+    const evalResult = await cdp.Runtime.evaluate({
       expression: args.expression,
       returnByValue: args.returnByValue ?? false,
       awaitPromise: args.awaitPromise ?? true,
@@ -110,9 +118,11 @@ export class RuntimeManager {
     maxProperties?: number;
     ownOnly?: boolean;
   }): Promise<Array<{ name: string; value: string; type: string; objectId?: string }>> {
+    const { cdp, assertCurrent } = this.capture();
     await this.ensureEnabled();
+    assertCurrent();
 
-    const result = await this.cdp.Runtime.getProperties({
+    const result = await cdp.Runtime.getProperties({
       objectId: args.objectId,
       ownProperties: args.ownOnly ?? true,
       generatePreview: true,

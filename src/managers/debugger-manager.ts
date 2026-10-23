@@ -10,19 +10,43 @@ import type {
   ScopeInfo, ScopeVariable, RemoteObject,
 } from '../types.js';
 import type { CDPClient } from '../cdp-client.js';
+import { SessionManager } from './session-manager.js';
+import { generatedLocation, type TraceManager } from './trace-manager.js';
+import type { SourceManager } from './source-manager.js';
+import type { GeneratedLocation } from '../types.js';
 
-export class DebuggerManager {
-  private cdpClient: CDPClient;
+export class DebuggerManager extends SessionManager {
   private enabled = false;
   private breakpoints = new Map<string, BreakpointInfo>();
   private pauseState: PauseState = { paused: false, callFrames: [] };
 
-  constructor(cdpClient: CDPClient) {
-    this.cdpClient = cdpClient;
+  private pauseWaiters = new Set<{ resolve: (state: PauseState) => void; reject: (err: Error) => void; timer: NodeJS.Timeout }>();
+  private pendingResolutions = new Map<string, GeneratedLocation[]>();
+  private stepPending = false;
+
+  constructor(cdpClient: CDPClient, private trace?: TraceManager, private source?: SourceManager) {
+    super(cdpClient);
   }
 
-  private get cdp() {
-    return this.cdpClient.cdp;
+  override reset(): void {
+    super.reset();
+    this.enabled = false;
+    this.breakpoints.clear();
+    this.pendingResolutions.clear();
+    this.pauseState = { paused: false, callFrames: [] };
+    this.stepPending = false;
+    for (const waiter of this.pauseWaiters) {
+      clearTimeout(waiter.timer);
+      waiter.reject(new Error('CDP session ended while waiting for a new pause event.'));
+    }
+    this.pauseWaiters.clear();
+  }
+
+  async release(): Promise<void> {
+    if (!this.enabled) return;
+    const cdp = this.cdp;
+    if (this.pauseState.paused) await cdp.Debugger.resume({});
+    await cdp.Debugger.disable();
   }
 
   // ── Enable / Setup ────────────────────────────────────────
@@ -32,10 +56,10 @@ export class DebuggerManager {
       return { enabled: true, message: 'Debugger already enabled' };
     }
 
-    await this.cdp.Debugger.enable({});
+    const { cdp, assertCurrent } = this.capture();
 
     // Listen for pause events
-    this.cdp.Debugger.paused((params: any) => {
+    this.listen('Debugger.paused', (params: any) => {
       this.pauseState = {
         paused: true,
         reason: params.reason,
@@ -43,22 +67,34 @@ export class DebuggerManager {
         callFrames: params.callFrames.map((f: any, i: number) => ({
           index: i,
           functionName: f.functionName || '(anonymous)',
-          url: f.url,
-          lineNumber: (f.location.lineNumber ?? 0) + 1, // CDP is 0-based, we return 1-based
-          columnNumber: f.location.columnNumber ?? 0,
+          url: f.url || this.source?.urlForScript(f.location.scriptId) || '',
+          ...generatedLocation(f.location),
           scopeChainLength: f.scopeChain.length,
           callFrameId: f.callFrameId,
         })),
         rawFrames: params.callFrames as RawCallFrame[],
       };
+      for (const waiter of this.pauseWaiters) waiter.resolve(this.getPauseInfo());
       console.error(`[debugger] Paused: ${params.reason} at ${this.pauseState.callFrames[0]?.url}:${this.pauseState.callFrames[0]?.lineNumber}`);
     });
 
-    this.cdp.Debugger.resumed(() => {
+    this.listen('Debugger.resumed', () => {
       this.pauseState = { paused: false, callFrames: [] };
       console.error('[debugger] Resumed');
     });
 
+    this.listen('Debugger.breakpointResolved', (params: any) => {
+      const location = generatedLocation(params.location);
+      const bp = this.breakpoints.get(params.breakpointId);
+      if (bp) this.addLocations(bp.locations, [location]);
+      else {
+        const pending = this.pendingResolutions.get(params.breakpointId) ?? [];
+        this.addLocations(pending, [location]);
+        this.pendingResolutions.set(params.breakpointId, pending);
+      }
+    });
+    await cdp.Debugger.enable({});
+    assertCurrent();
     this.enabled = true;
     return { enabled: true, message: 'Debugger enabled. Listening for pause events.' };
   }
@@ -71,25 +107,7 @@ export class DebuggerManager {
     columnNumber?: number;
     condition?: string;
   }): Promise<BreakpointInfo> {
-    await this.ensureEnabled();
-
-    const result = await this.cdp.Debugger.setBreakpointByUrl({
-      lineNumber: args.lineNumber - 1,
-      url: args.url,
-      columnNumber: args.columnNumber ? args.columnNumber - 1 : undefined,
-      condition: args.condition,
-    });
-
-    const bp: BreakpointInfo = {
-      id: result.breakpointId,
-      url: args.url,
-      lineNumber: args.lineNumber,
-      columnNumber: args.columnNumber,
-      condition: args.condition,
-    };
-
-    this.breakpoints.set(bp.id, bp);
-    return bp;
+    return this.setUrlBreakpoint(args);
   }
 
   async setBreakpointByUrlRegex(args: {
@@ -98,31 +116,50 @@ export class DebuggerManager {
     columnNumber?: number;
     condition?: string;
   }): Promise<BreakpointInfo> {
+    return this.setUrlBreakpoint(args);
+  }
+
+  private async setUrlBreakpoint(args: {
+    url?: string; urlRegex?: string; lineNumber: number; columnNumber?: number; condition?: string;
+  }): Promise<BreakpointInfo> {
+    if (!Number.isInteger(args.lineNumber) || args.lineNumber < 1 ||
+      !Number.isInteger(args.columnNumber ?? 0) || (args.columnNumber ?? 0) < 0) {
+      throw new Error('Generated coordinates require a 1-based line and a 0-based column.');
+    }
+    const { cdp, assertCurrent } = this.capture();
     await this.ensureEnabled();
-
-    const result = await this.cdp.Debugger.setBreakpointByUrl({
-      lineNumber: args.lineNumber - 1,
-      urlRegex: args.urlRegex,
-      columnNumber: args.columnNumber ? args.columnNumber - 1 : undefined,
-      condition: args.condition,
+    assertCurrent();
+    const result = await cdp.Debugger.setBreakpointByUrl({
+      ...args, lineNumber: args.lineNumber - 1, columnNumber: args.columnNumber ?? 0,
     });
-
+    assertCurrent();
+    const locations: GeneratedLocation[] = (result.locations ?? []).map(generatedLocation);
+    this.addLocations(locations, this.pendingResolutions.get(result.breakpointId) ?? []);
+    this.pendingResolutions.delete(result.breakpointId);
     const bp: BreakpointInfo = {
-      id: result.breakpointId,
-      url: args.urlRegex,
-      lineNumber: args.lineNumber,
-      columnNumber: args.columnNumber,
-      condition: args.condition,
+      id: result.breakpointId, url: args.url ?? args.urlRegex!, lineNumber: args.lineNumber,
+      columnNumber: args.columnNumber ?? 0, condition: args.condition, locations,
     };
-
     this.breakpoints.set(bp.id, bp);
+    for (const location of result.locations ?? []) this.trace?.resolved(bp.id, location);
     return bp;
   }
 
+  private addLocations(existing: GeneratedLocation[], incoming: GeneratedLocation[]): void {
+    for (const location of incoming) {
+      if (!existing.some(p => p.scriptId === location.scriptId && p.lineNumber === location.lineNumber &&
+        p.columnNumber === location.columnNumber)) existing.push(location);
+    }
+  }
+
   async removeBreakpoint(breakpointId: string): Promise<{ removed: boolean }> {
+    const { cdp, assertCurrent } = this.capture();
     await this.ensureEnabled();
-    await this.cdp.Debugger.removeBreakpoint({ breakpointId });
+    assertCurrent();
+    await cdp.Debugger.removeBreakpoint({ breakpointId });
+    assertCurrent();
     this.breakpoints.delete(breakpointId);
+    this.pendingResolutions.delete(breakpointId);
     return { removed: true };
   }
 
@@ -133,49 +170,44 @@ export class DebuggerManager {
   // ── Exception Breakpoints ─────────────────────────────────
 
   async setExceptionBreakpoints(state: 'none' | 'uncaught' | 'all'): Promise<{ state: string }> {
+    const { cdp, assertCurrent } = this.capture();
     await this.ensureEnabled();
-    await this.cdp.Debugger.setPauseOnExceptions({ state });
+    assertCurrent();
+    await cdp.Debugger.setPauseOnExceptions({ state });
     return { state };
   }
 
   // ── Execution Control ─────────────────────────────────────
 
-  async pause(): Promise<{ paused: boolean; message: string }> {
+  async pause(): Promise<PauseState> {
+    const { assertCurrent } = this.capture();
     await this.ensureEnabled();
-    await this.cdp.Debugger.pause();
-    await new Promise(r => setTimeout(r, 200));
-    return {
-      paused: this.pauseState.paused,
-      message: this.pauseState.paused ? 'Execution paused' : 'Pause requested',
-    };
+    assertCurrent();
+    if (this.pauseState.paused) return this.getPauseInfo();
+    return this.waitForNewPause(cdp => cdp.Debugger.pause(), 5000);
   }
 
   async resume(): Promise<{ resumed: boolean }> {
     this.ensurePaused();
-    await this.cdp.Debugger.resume({});
-    await new Promise(r => setTimeout(r, 100));
-    return { resumed: !this.pauseState.paused };
+    const { cdp, assertCurrent } = this.capture();
+    await cdp.Debugger.resume({});
+    assertCurrent();
+    return { resumed: true };
   }
 
-  async stepOver(): Promise<PauseState> {
+  async stepOver(timeoutMs = 5000): Promise<PauseState> {
     this.ensurePaused();
-    await this.cdp.Debugger.stepOver({});
-    await this.waitForPause(5000);
-    return this.getPauseInfo();
+    return this.waitForNewPause(cdp => cdp.Debugger.stepOver({}), timeoutMs);
   }
 
-  async stepInto(): Promise<PauseState> {
+  async stepInto(timeoutMs = 5000): Promise<PauseState> {
     this.ensurePaused();
-    await this.cdp.Debugger.stepInto({});
-    await this.waitForPause(5000);
-    return this.getPauseInfo();
+    return this.waitForNewPause(cdp => cdp.Debugger.stepInto({}), timeoutMs);
   }
 
-  async stepOut(): Promise<PauseState> {
+  async stepOut(timeoutMs = 5000): Promise<PauseState> {
     this.ensurePaused();
-    await this.cdp.Debugger.stepOut({});
-    await this.waitForPause(5000);
-    return this.getPauseInfo();
+    return this.waitForNewPause(cdp => cdp.Debugger.stepOut({}), timeoutMs);
   }
 
   // ── Call Stack ─────────────────────────────────────────────
@@ -207,12 +239,13 @@ export class DebuggerManager {
     const maxProps = args.maxProperties ?? 20;
     const rawFrames = this.pauseState.rawFrames;
 
-    if (!rawFrames || frameIndex >= rawFrames.length) {
+    if (!rawFrames || !Number.isInteger(frameIndex) || frameIndex < 0 || frameIndex >= rawFrames.length) {
       throw new Error(`Frame index ${frameIndex} out of range (${rawFrames?.length ?? 0} frames)`);
     }
 
     const frame = rawFrames[frameIndex];
     const scopes: ScopeInfo[] = [];
+    const { cdp, assertCurrent } = this.capture();
 
     for (const scope of frame.scopeChain) {
       if (scope.type === 'global') {
@@ -228,12 +261,13 @@ export class DebuggerManager {
       if (!objectId) continue;
 
       try {
-        const propsResult = await this.cdp.Runtime.getProperties({
+        const propsResult = await cdp.Runtime.getProperties({
           objectId,
           ownProperties: true,
           generatePreview: true,
         });
 
+        assertCurrent();
         const variables: ScopeVariable[] = propsResult.result
           .slice(0, maxProps)
           .map((prop: any) => ({
@@ -249,6 +283,7 @@ export class DebuggerManager {
           variables,
         });
       } catch (err) {
+        assertCurrent();
         scopes.push({
           type: scope.type,
           name: scope.name,
@@ -272,7 +307,7 @@ export class DebuggerManager {
     const frameIndex = args.frameIndex ?? 0;
     const rawFrames = this.pauseState.rawFrames;
 
-    if (!rawFrames || frameIndex >= rawFrames.length) {
+    if (!rawFrames || !Number.isInteger(frameIndex) || frameIndex < 0 || frameIndex >= rawFrames.length) {
       throw new Error(`Frame index ${frameIndex} out of range`);
     }
 
@@ -304,8 +339,10 @@ export class DebuggerManager {
   // ── Blackbox Scripts ──────────────────────────────────────
 
   async setBlackboxPatterns(patterns: string[]): Promise<{ patterns: string[] }> {
+    const { cdp, assertCurrent } = this.capture();
     await this.ensureEnabled();
-    await this.cdp.Debugger.setBlackboxPatterns({ patterns });
+    assertCurrent();
+    await cdp.Debugger.setBlackboxPatterns({ patterns });
     return { patterns };
   }
 
@@ -323,11 +360,39 @@ export class DebuggerManager {
     }
   }
 
-  private async waitForPause(timeoutMs: number): Promise<void> {
-    const start = Date.now();
-    while (Date.now() - start < timeoutMs) {
-      if (this.pauseState.paused) return;
-      await new Promise(r => setTimeout(r, 50));
+  private async waitForNewPause(
+    command: (cdp: CDPClient['cdp']) => Promise<unknown>, timeoutMs: number,
+  ): Promise<PauseState> {
+    if (this.stepPending) throw new Error('Another pause or step operation is already pending.');
+    const { cdp, assertCurrent } = this.capture();
+    this.stepPending = true;
+    let resolvePause!: (state: PauseState) => void;
+    let rejectOperation!: (error: Error) => void;
+    const nextPause = new Promise<PauseState>(resolve => { resolvePause = resolve; });
+    const aborted = new Promise<never>((_, reject) => { rejectOperation = reject; });
+    const waiter = {
+      resolve: resolvePause,
+      reject: rejectOperation,
+      timer: setTimeout(() => rejectOperation(
+        new Error(`Timed out after ${timeoutMs}ms waiting for a NEW Debugger.paused event and command reply.`),
+      ), timeoutMs),
+    };
+    this.pauseWaiters.add(waiter);
+    try {
+      // Register BEFORE sending: CDP can emit paused before its command reply.
+      // The deadline/session-end signal also covers a reply that never arrives.
+      const [, state] = await Promise.race([
+        Promise.all([command(cdp), nextPause]), aborted,
+      ]);
+      assertCurrent();
+      return state;
+    } finally {
+      clearTimeout(waiter.timer);
+      this.pauseWaiters.delete(waiter);
+      // An old operation must not change the busy flag of a replacement session.
+      if (this.cdpClient.connectionState.sessionId) {
+        try { assertCurrent(); this.stepPending = false; } catch { /* replaced */ }
+      }
     }
   }
 

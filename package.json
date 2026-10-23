@@ -9,6 +9,9 @@
   },
   "scripts": {
     "build": "tsc",
+    "test": "npm run build && node --test tests/*.test.mjs",
+    "test:unit": "npm run build && node --test tests/trace.test.mjs",
+    "test:acceptance": "npm run build && node --test tests/lazy-spa.test.mjs",
     "dev": "tsc --watch",
     "start": "node dist/bin/cdp-mcp-server.js",
     "start:http": "node dist/bin/cdp-mcp-server.js --http --port 3100",

@@ -12,6 +12,8 @@ export interface TargetInfo {
 
 export interface ConnectionState {
   connected: boolean;
+  /** Unique ID for this attachment, including reattachments to the same target. */
+  sessionId?: string;
   targetId?: string;
   targetUrl?: string;
   browserVersion?: string;
@@ -25,9 +27,39 @@ export interface BreakpointInfo {
   lineNumber: number;
   columnNumber?: number;
   condition?: string;
+  /** Generated coordinates: line 1-based, column 0-based. */
+  locations: GeneratedLocation[];
+}
+
+/** Public generated coordinates. Only the CDP boundary uses 0-based lines. */
+export interface GeneratedLocation {
+  scriptId: string;
+  lineNumber: number;
+  columnNumber: number;
+}
+
+export interface TraceEvent {
+  cursor: number;
+  timestamp: number;
+  targetId: string;
+  sessionId: string;
+  type: 'scriptParsed' | 'breakpointResolved' | 'paused' | 'resumed' | 'scriptRequest' | 'mark';
+  url?: string;
+  scriptId?: string;
+  lineNumber?: number;
+  columnNumber?: number;
+  endLine?: number;
+  endColumn?: number;
+  breakpointId?: string;
+  hitBreakpoints?: string[];
+  reason?: string;
+  requestId?: string;
+  method?: string;
+  label?: string;
 }
 
 export interface CallFrame {
+  scriptId: string;
   index: number;
   functionName: string;
   url: string;
@@ -105,6 +137,7 @@ export interface PausedRequest {
 export interface ScriptInfo {
   scriptId: string;
   url: string;
+  /** Generated lines are 1-based; columns are 0-based. */
   startLine: number;
   startColumn: number;
   endLine: number;
