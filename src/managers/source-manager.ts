@@ -5,30 +5,34 @@
 import { SourceMapConsumer } from 'source-map';
 import type { ScriptInfo, SourceMapResult } from '../types.js';
 import type { CDPClient } from '../cdp-client.js';
+import { SessionManager } from './session-manager.js';
 
-export class SourceManager {
-  private cdpClient: CDPClient;
+export class SourceManager extends SessionManager {
   private scripts = new Map<string, ScriptInfo>();
   private listening = false;
 
   constructor(cdpClient: CDPClient) {
-    this.cdpClient = cdpClient;
+    super(cdpClient);
   }
 
-  private get cdp() {
-    return this.cdpClient.cdp;
+  override reset(): void {
+    super.reset();
+    this.scripts.clear();
+    this.listening = false;
   }
+
+  urlForScript(scriptId: string): string | undefined { return this.scripts.get(scriptId)?.url; }
 
   async startListening(): Promise<void> {
     if (this.listening) return;
 
-    this.cdp.Debugger.scriptParsed((params: any) => {
+    this.listen('Debugger.scriptParsed', (params: any) => {
       const info: ScriptInfo = {
         scriptId: params.scriptId,
         url: params.url,
-        startLine: params.startLine,
+        startLine: params.startLine + 1,
         startColumn: params.startColumn,
-        endLine: params.endLine,
+        endLine: params.endLine + 1,
         endColumn: params.endColumn,
         sourceMapURL: params.sourceMapURL,
         length: params.length,

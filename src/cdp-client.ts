@@ -6,6 +6,7 @@
  */
 
 import CDP from 'chrome-remote-interface';
+import { randomUUID } from 'node:crypto';
 import { spawn, type ChildProcess } from 'node:child_process';
 import { mkdtempSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -17,6 +18,30 @@ export class CDPClient {
   private chromeProcess: ChildProcess | null = null;
   private args: CLIArgs;
   private _connectionState: ConnectionState = { connected: false };
+
+  private sessionEndListeners = new Set<() => void>();
+  private sessionStartListeners = new Set<() => Promise<void>>();
+  private beforeDisconnectListeners = new Set<() => Promise<void>>();
+  private transition: Promise<unknown> = Promise.resolve();
+  private disconnectListener?: () => void;
+
+  onSessionEnd(listener: () => void): void { this.sessionEndListeners.add(listener); }
+  onSessionStart(listener: () => Promise<void>): void { this.sessionStartListeners.add(listener); }
+  beforeDisconnect(listener: () => Promise<void>): void { this.beforeDisconnectListeners.add(listener); }
+
+  private serialize<T>(operation: () => Promise<T>): Promise<T> {
+    const result = this.transition.then(operation);
+    this.transition = result.catch(() => {});
+    return result;
+  }
+
+  private invalidateSession(): void {
+    if (this.client && this.disconnectListener) this.client.removeListener('disconnect', this.disconnectListener);
+    this.disconnectListener = undefined;
+    this.client = null;
+    this._connectionState = { connected: false };
+    for (const listener of this.sessionEndListeners) listener();
+  }
 
   constructor(args: CLIArgs) {
     this.args = args;
@@ -36,25 +61,27 @@ export class CDPClient {
   /**
    * Connect to a running Chrome instance, or launch one if needed.
    */
-  async connect(): Promise<ConnectionState> {
+  connect(): Promise<ConnectionState> {
+    return this.serialize(() => this.connectInternal());
+  }
+
+  private async connectInternal(): Promise<ConnectionState> {
+    await this.disconnectInternal();
     const { chromePort, connectionMode } = this.args;
 
-    // Try to discover an existing debuggable instance
     if (connectionMode !== 'launch') {
+      let version;
       try {
-        const version = await CDP.Version({ port: chromePort });
-        console.error(`[cdp-client] Found Chrome: ${version.Browser}`);
-        this._connectionState.browserVersion = version.Browser;
-        await this.attachToFirstPage();
-        return this.connectionState;
+        version = await CDP.Version({ port: chromePort });
       } catch {
         if (connectionMode === 'attach') {
-          throw new Error(
-            `No debuggable Chrome found on port ${chromePort}. ` +
-            `Start Chromium with: chromium --remote-debugging-port=${chromePort}`
-          );
+          throw new Error(`No debuggable Chrome found on port ${chromePort}.`);
         }
-        console.error(`[cdp-client] No Chrome on port ${chromePort}, launching...`);
+      }
+      if (version) {
+        await this.attachToFirstPage();
+        this._connectionState.browserVersion = version.Browser;
+        return this.connectionState;
       }
     }
 
@@ -81,42 +108,57 @@ export class CDPClient {
   /**
    * Attach to a specific target by ID.
    */
-  async attachTarget(targetId: string): Promise<void> {
-    if (this.client) {
-      try { await this.client.close(); } catch { /* ignore */ }
-    }
+  attachTarget(targetId: string): Promise<ConnectionState> {
+    return this.serialize(async () => {
+      await this.attachTargetInternal(targetId);
+      return this.connectionState;
+    });
+  }
 
-    this.client = await CDP({ port: this.args.chromePort, target: targetId });
-    this._connectionState = {
-      connected: true,
-      targetId,
-      targetUrl: undefined,
-      browserVersion: this._connectionState.browserVersion,
-    };
-
-    // Get the target URL
+  private async attachTargetInternal(targetId: string): Promise<void> {
+    await this.disconnectInternal();
     const targets = await this.listTargets();
     const target = targets.find(t => t.id === targetId);
-    if (target) {
-      this._connectionState.targetUrl = target.url;
+    if (!target) throw new Error(`Target not found: ${targetId}`);
+    const client = await CDP({ port: this.args.chromePort, target: targetId });
+    this.client = client;
+    this._connectionState = {
+      connected: true, sessionId: randomUUID(), targetId, targetUrl: target.url,
+    };
+    const onDisconnect = () => {
+      client.removeListener('disconnect', onDisconnect);
+      if (this.client === client) this.invalidateSession();
+    };
+    this.disconnectListener = onDisconnect;
+    client.on('disconnect', onDisconnect);
+    try {
+      for (const listener of this.sessionStartListeners) await listener();
+    } catch (error) {
+      await this.disconnectInternal();
+      throw error;
     }
-
     console.error(`[cdp-client] Attached to target: ${targetId}`);
   }
 
-  /**
-   * Disconnect from the current target (does NOT kill Chrome).
-   */
-  async disconnect(): Promise<void> {
-    if (this.client) {
-      try { await this.client.close(); } catch { /* ignore */ }
-      this.client = null;
+  /** Disconnect and invalidate all managers, even when the socket has died. */
+  disconnect(): Promise<void> {
+    return this.serialize(() => this.disconnectInternal());
+  }
+
+  private async disconnectInternal(): Promise<void> {
+    const client = this.client;
+    try {
+      if (client) {
+        for (const listener of this.beforeDisconnectListeners) {
+          try { await listener(); } catch { /* best effort on a lost connection */ }
+        }
+      }
+    } finally {
+      this.invalidateSession();
+      if (client) {
+        try { await client.close(); } catch { /* already closed */ }
+      }
     }
-    this._connectionState = {
-      connected: false,
-      browserVersion: this._connectionState.browserVersion,
-    };
-    console.error('[cdp-client] Disconnected from target');
   }
 
   /**
@@ -143,7 +185,7 @@ export class CDPClient {
       throw new Error('No page targets found. Open a tab in Chrome first.');
     }
 
-    await this.attachTarget(page.id);
+    await this.attachTargetInternal(page.id);
   }
 
   private async launchChrome(): Promise<void> {

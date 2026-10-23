@@ -25,6 +25,8 @@ declare module 'chrome-remote-interface' {
   }
 
   interface CDPClient {
+    on(event: string, listener: (...args: any[]) => void): this;
+    removeListener(event: string, listener: (...args: any[]) => void): this;
     close(): Promise<void>;
     send(method: string, params?: any): Promise<any>;
 
