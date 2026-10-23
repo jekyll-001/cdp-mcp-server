@@ -57,7 +57,8 @@ test('two-tab lazy SPA: pre-load breakpoint, scopes, new step, ordered timeline,
       browser.kill('SIGTERM');
       await exited;
     }
-    await rm(profile, { recursive: true, force: true });
+    // Chromium helpers can finish profile writes just after the parent exits.
+    await rm(profile, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
   });
   const port = await until(async () => {
     if (browserError) throw browserError;
